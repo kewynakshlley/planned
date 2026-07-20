@@ -1,5 +1,4 @@
 import { customAlphabet } from "nanoid";
-import { getRedis } from "./redis";
 import type {
   Participant,
   ParticipantView,
@@ -16,7 +15,7 @@ const generateParticipantId = customAlphabet(
   16
 );
 
-const ROOM_TTL_SECONDS = 60 * 60 * 24; // 24h
+const ROOM_TTL_MS = 60 * 60 * 24 * 1000; // 24h
 
 type RoomMeta = {
   id: string;
@@ -24,87 +23,39 @@ type RoomMeta = {
   roundName: string;
   createdAt: number;
   revealed: boolean;
+  expiresAt: number;
+  participants: Record<string, Participant>;
 };
 
-function metaKey(roomId: string): string {
-  return `room:${roomId}:meta`;
-}
+const rooms = new Map<string, RoomMeta>();
 
-function participantsKey(roomId: string): string {
-  return `room:${roomId}:participants`;
-}
-
-async function getMeta(roomId: string): Promise<RoomMeta | null> {
-  const redis = getRedis();
-  const meta = await redis.get<RoomMeta>(metaKey(roomId));
-  return meta ?? null;
-}
-
-async function saveMeta(meta: RoomMeta): Promise<void> {
-  const redis = getRedis();
-  await redis.set(metaKey(meta.id), meta, { ex: ROOM_TTL_SECONDS });
-}
-
-async function getParticipants(
-  roomId: string
-): Promise<Record<string, Participant>> {
-  const redis = getRedis();
-  const raw = await redis.hgetall<Record<string, string>>(
-    participantsKey(roomId)
-  );
-  const participants: Record<string, Participant> = {};
-  if (!raw) return participants;
-
-  for (const [id, value] of Object.entries(raw)) {
-    try {
-      participants[id] =
-        typeof value === "string" ? JSON.parse(value) : (value as Participant);
-    } catch {
-      // skip corrupt entries
-    }
-  }
-  return participants;
-}
-
-async function saveParticipant(
-  roomId: string,
-  participant: Participant
-): Promise<void> {
-  const redis = getRedis();
-  await redis.hset(participantsKey(roomId), {
-    [participant.id]: JSON.stringify(participant),
-  });
-  await redis.expire(participantsKey(roomId), ROOM_TTL_SECONDS);
-}
-
-async function getParticipant(
-  roomId: string,
-  participantId: string
-): Promise<Participant | null> {
-  const redis = getRedis();
-  const raw = await redis.hget<string>(participantsKey(roomId), participantId);
-  if (!raw) return null;
-  try {
-    return typeof raw === "string" ? JSON.parse(raw) : (raw as Participant);
-  } catch {
+function getMeta(roomId: string): RoomMeta | null {
+  const meta = rooms.get(roomId);
+  if (!meta) return null;
+  if (meta.expiresAt < Date.now()) {
+    rooms.delete(roomId);
     return null;
   }
+  return meta;
 }
 
-async function buildRoom(meta: RoomMeta): Promise<Room> {
-  const participants = await getParticipants(meta.id);
+function touchExpiry(meta: RoomMeta): void {
+  meta.expiresAt = Date.now() + ROOM_TTL_MS;
+}
+
+function buildRoom(meta: RoomMeta): Room {
   return {
     id: meta.id,
     name: meta.name,
     roundName: meta.roundName,
     createdAt: meta.createdAt,
     revealed: meta.revealed,
-    participants,
+    participants: meta.participants,
   };
 }
 
 export async function getRoom(roomId: string): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
   return buildRoom(meta);
 }
@@ -113,10 +64,8 @@ export async function createRoom(
   name: string,
   roundName?: string
 ): Promise<Room> {
-  const redis = getRedis();
   let id = generateRoomId();
-
-  while (await redis.exists(metaKey(id))) {
+  while (getMeta(id)) {
     id = generateRoomId();
   }
 
@@ -126,10 +75,12 @@ export async function createRoom(
     roundName: roundName?.trim().slice(0, 120) ?? "",
     createdAt: Date.now(),
     revealed: false,
+    expiresAt: Date.now() + ROOM_TTL_MS,
+    participants: {},
   };
 
-  await saveMeta(meta);
-  return { ...meta, participants: {} };
+  rooms.set(id, meta);
+  return buildRoom(meta);
 }
 
 export async function joinRoom(
@@ -137,7 +88,7 @@ export async function joinRoom(
   name: string,
   isSpectator: boolean
 ): Promise<{ room: Room; participantId: string } | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
   const participantId = generateParticipantId();
@@ -151,30 +102,24 @@ export async function joinRoom(
     lastSeen: now,
   };
 
-  await saveParticipant(roomId, participant);
-  await redisExpireMeta(roomId);
+  meta.participants[participantId] = participant;
+  touchExpiry(meta);
 
-  const room = await buildRoom(meta);
-  return { room, participantId };
-}
-
-async function redisExpireMeta(roomId: string): Promise<void> {
-  const redis = getRedis();
-  await redis.expire(metaKey(roomId), ROOM_TTL_SECONDS);
+  return { room: buildRoom(meta), participantId };
 }
 
 export async function touchParticipant(
   roomId: string,
   participantId: string
 ): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
-  const participant = await getParticipant(roomId, participantId);
+  const participant = meta.participants[participantId];
   if (!participant) return null;
 
   participant.lastSeen = Date.now();
-  await saveParticipant(roomId, participant);
+  touchExpiry(meta);
 
   return buildRoom(meta);
 }
@@ -184,10 +129,10 @@ export async function castVote(
   participantId: string,
   vote: VoteValue | null
 ): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
-  const participant = await getParticipant(roomId, participantId);
+  const participant = meta.participants[participantId];
   if (!participant) return null;
 
   if (vote !== null && !VOTE_VALUES.includes(vote)) {
@@ -196,17 +141,17 @@ export async function castVote(
 
   participant.vote = vote;
   participant.lastSeen = Date.now();
-  await saveParticipant(roomId, participant);
+  touchExpiry(meta);
 
   return buildRoom(meta);
 }
 
 export async function revealVotes(roomId: string): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
   meta.revealed = true;
-  await saveMeta(meta);
+  touchExpiry(meta);
 
   return buildRoom(meta);
 }
@@ -215,11 +160,11 @@ export async function setRoundName(
   roomId: string,
   roundName: string
 ): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
   meta.roundName = roundName.trim().slice(0, 120);
-  await saveMeta(meta);
+  touchExpiry(meta);
 
   return buildRoom(meta);
 }
@@ -228,21 +173,17 @@ export async function resetRound(
   roomId: string,
   roundName?: string
 ): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
   meta.revealed = false;
   if (roundName !== undefined) {
     meta.roundName = roundName.trim().slice(0, 120);
   }
-  await saveMeta(meta);
-
-  const participants = await getParticipants(roomId);
-  await Promise.all(
-    Object.values(participants).map((participant) =>
-      saveParticipant(roomId, { ...participant, vote: null })
-    )
-  );
+  for (const participant of Object.values(meta.participants)) {
+    participant.vote = null;
+  }
+  touchExpiry(meta);
 
   return buildRoom(meta);
 }
@@ -251,11 +192,10 @@ export async function leaveRoom(
   roomId: string,
   participantId: string
 ): Promise<Room | null> {
-  const meta = await getMeta(roomId);
+  const meta = getMeta(roomId);
   if (!meta) return null;
 
-  const redis = getRedis();
-  await redis.hdel(participantsKey(roomId), participantId);
+  delete meta.participants[participantId];
 
   return buildRoom(meta);
 }
